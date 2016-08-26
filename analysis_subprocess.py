@@ -102,8 +102,8 @@ def set_win_appusermodel(window_id):
     relaunch_command = executable + ' ' + os.path.abspath(__file__.replace('.pyc', '.py'))
     relaunch_display_name = app_descriptions['lyse']
     set_appusermodel(window_id, appids['lyse'], icon_path, relaunch_command, relaunch_display_name)
-    
-    
+
+
 class PlotWindow(QtGui.QWidget):
     # A signal for when the window manager has created a new window for this widget:
     newWindow = Signal(int)
@@ -118,7 +118,7 @@ class PlotWindow(QtGui.QWidget):
     def closeEvent(self, event):
         self.hide()
         event.ignore()
-        
+
 
 class Plot(object):
     def __init__(self, figure, identifier, filepath):
@@ -211,23 +211,23 @@ class AnalysisWorker(object):
         self.to_parent = to_parent
         self.from_parent = from_parent
         self.filepath = filepath
-        
+
         # Add user script directory to the pythonpath:
         sys.path.insert(0, os.path.dirname(self.filepath))
-        
+
         # Plot objects, keyed by matplotlib Figure object:
         self.plots = {}
 
         # An object with a method to unload user modules if any have
         # changed on disk:
         self.modulewatcher = ModuleWatcher()
-        
+
         # Start the thread that listens for instructions from the
         # parent process:
         self.mainloop_thread = threading.Thread(target=self.mainloop)
         self.mainloop_thread.daemon = True
         self.mainloop_thread.start()
-        
+
     def mainloop(self):
         # HDF5 prints lots of errors by default, for things that aren't
         # actually errors. These are silenced on a per thread basis,
@@ -235,22 +235,23 @@ class AnalysisWorker(object):
         # imported. So we'll silence them in this thread too:
         h5py._errors.silence_errors()
         while True:
+            # data is now a dictionary
             task, data = self.from_parent.get()
             with kill_lock:
                 if task == 'quit':
                     inmain(qapplication.quit)
                 elif task == 'analyse':
-                    path = data
-                    success = self.do_analysis(path)
+                    path = data['filepath']
+                    success = self.do_analysis(path, {k:v for k,v in data.iteritems() if k != 'filepath'})
                     if success:
                         self.to_parent.put(['done', None])
                     else:
                         self.to_parent.put(['error', None])
                 else:
                     self.to_parent.put(['error','invalid task %s'%str(task)])
-        
+
     @inmain_decorator()
-    def do_analysis(self, path):
+    def do_analysis(self, path, user_vars=None):
         now = time.strftime('[%x %X]')
         if path is not None:
             print('%s %s %s ' %(now, os.path.basename(self.filepath), os.path.basename(path)))
@@ -270,6 +271,8 @@ class AnalysisWorker(object):
         sandbox.deprecation_messages['path'] = deprecation_message
         # Use lyse.path instead:
         lyse.path = path
+        if user_vars:
+            lyse.user_vars = user_vars
 
         # Do not let the modulewatcher unload any modules whilst we're working:
         try:
@@ -287,7 +290,7 @@ class AnalysisWorker(object):
         finally:
             print('')
             self.post_analysis_plot_actions()
-        
+
     def pre_analysis_plot_actions(self):
         for plot in self.plots.values():
             plot.save_axis_limits()
@@ -321,15 +324,14 @@ class AnalysisWorker(object):
 
     def reset_figs(self):
         pass
-        
-        
+
+
 if __name__ == '__main__':
     filepath = from_parent.get()
-    
+
     # Set a meaningful client id for zprocess.locking:
     zprocess.locking.set_client_process_name('lyse-'+os.path.basename(filepath))
-    
+
     qapplication = QtGui.QApplication(sys.argv)
     worker = AnalysisWorker(filepath, to_parent, from_parent)
     qapplication.exec_()
-        

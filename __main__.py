@@ -11,7 +11,7 @@ import threading
 import signal
 import subprocess
 import time
-
+from collections import OrderedDict
 
 # Turn on our error catching for all subsequent imports
 import labscript_utils.excepthook
@@ -218,7 +218,6 @@ class AnalysisRoutine(object):
         self.done = False
 
         self.to_worker, self.from_worker, self.worker = self.start_worker()
-
         # Make a row to put into the model:
         active_item =  QtGui.QStandardItem()
         active_item.setCheckable(True)
@@ -229,7 +228,35 @@ class AnalysisRoutine(object):
         name_item.setData(self.filepath, self.ROLE_FULLPATH)
         self.model.appendRow([active_item, info_item, name_item])
 
+
         self.exiting = False
+
+    def _read_user_vars(self):
+        """get all variables called in main function by looking
+        at source code.  Get a better verison later"""
+        with open(self.filepath,'r') as fp:
+            source = fp.readlines()
+        # go through list and find main function
+        for line in source:
+            if 'def main' in line:
+                args = line[line.find("(")+1:line.find(")")].split(',')
+                break
+        user_vars = OrderedDict()
+        for arg in args:
+            arg = arg.replace(" ", "")
+            if arg not in ['*args', '**kwargs']:
+                try:
+                    k,v = arg.split('=')
+                    user_vars[k] = v
+                except:
+                    user_vars[arg] = None
+        self.user_vars = {self.shortname:user_vars}
+        return user_vars
+
+    def update_user_vars(self, dic):
+        """get user input through main window
+        when update button is clicked, a new dictionary will be sent"""
+        self.user_vars = dic
 
     def start_worker(self):
         # Start a worker process for this analysis routine:
@@ -240,7 +267,9 @@ class AnalysisRoutine(object):
         return to_worker, from_worker, worker
 
     def do_analysis(self, filepath):
-        self.to_worker.put(['analyse', filepath])
+        data = dict(self.user_vars[self.shortname])
+        data['filepath'] = filepath
+        self.to_worker.put(['analyse', data])
         signal, data = self.from_worker.get()
         if signal == 'error':
             return False
@@ -386,6 +415,8 @@ class TreeView(QtGui.QTreeView):
         self._double_click = False
         return result
 
+class SenderObject(QtCore.QObject):
+    send_sig = QtCore.pyqtSignal()
 
 class RoutineBox(object):
 
@@ -461,7 +492,8 @@ class RoutineBox(object):
         self.last_opened_routine_folder = self.exp_config.get('paths', 'analysislib')
 
         self.routines = []
-
+        self.user_vars = {}
+        self.sender = SenderObject()
         self.connect_signals()
 
         self.analysis = threading.Thread(target = self.analysis_loop)
@@ -511,6 +543,9 @@ class RoutineBox(object):
                 continue
             routine = AnalysisRoutine(filepath, self.model, self.output_box_port)
             self.routines.append(routine)
+            self.user_vars[routine.shortname] = routine._read_user_vars()
+            #need to redo connections to all routines when emmited
+            self.sender.send_sig.emit()
         self.update_select_all_checkstate()
 
     def on_treeview_double_left_clicked(self, index):
@@ -1600,6 +1635,81 @@ class FileBox(object):
                 self.pause_analysis()
                 return
 
+class ParameterSelector(QtGui.QWidget):
+    """the parameter selector will infer type from default value"""
+    def __init_(self, parent = None):
+        QtGui.QWidget.__init__(self, parent)
+
+    def init_params(self, var_dict):
+        form = QtGui.QFormLayout()
+        self.param_vals = {}
+        self.param_types = {}
+        self.var_dict = var_dict
+        for k,v in var_dict.iteritems():
+            if isinstance(v, unicode):
+                self.param_types[k] = 'str'
+                self.param_vals[k] = QtGui.QLineEdit()
+                self.param_vals[k].setText(str(v.lstrip('"').rstrip('"')))
+            elif isinstance(v,bool):
+                self.param_types[k] = 'bool'
+                # TODO add booleans
+            else:
+                #assume number
+                self.param_types[k] = 'num'
+                self.param_vals[k] = QtGui.QLineEdit()
+                self.param_vals[k].setText(str(v))
+
+
+            form.addRow(k,self.param_vals[k])
+
+        self.setLayout(form)
+
+    def get_values(self):
+        dic = {}
+        for k,v in self.param_vals.iteritems():
+            if self.param_types[k] == 'str':
+                dic[k] = v.text()
+            else:
+                dic[k] = float(v.text())
+        return dic
+
+class VariableBox(QtGui.QWidget):
+    new_vars = QtCore.pyqtSignal(object)
+    def __init__(self, parent=None):
+        QtGui.QWidget.__init__(self, parent)
+        self.tabs = QtGui.QTabWidget()
+        self.routines = OrderedDict()
+        self.par_select = {}
+        self.button = QtGui.QPushButton('Update Variables')
+
+        self.button.clicked.connect(self._on_update)
+
+        layout = QtGui.QVBoxLayout()
+        layout.addWidget(self.tabs)
+        layout.addWidget(self.button)
+        self.setLayout(layout)
+
+    def add_variables(self, var_dict):
+        """for now we are passed all the variables, lets keep track of
+        the ones we already have to keep order.  In future make this more efficient"""
+        # TODO only pass new variables
+        var_keys = list(var_dict.keys())
+        new_key = list(set(var_keys) - set(self.routines.keys()))[0]
+
+        self.routines.update({new_key:var_dict[new_key]})
+        self.par_select[new_key] = ParameterSelector()
+        self.par_select[new_key].init_params(var_dict[new_key])
+        self.tabs.addTab(self.par_select[new_key], new_key)
+
+    def _on_update(self):
+        dic = self.read_parameters()
+        self.new_vars.emit(dic)
+
+    def read_parameters(self):
+        dic = {}
+        for k,v in self.par_select.iteritems():
+            dic[k] = v.get_values()
+        return dic
 
 class Lyse(object):
 
@@ -1629,13 +1739,28 @@ class Lyse(object):
         self.filebox = FileBox(self.ui.verticalLayout_filebox, self.exp_config,
                                to_singleshot, from_singleshot, to_multishot, from_multishot)
 
+        self.variable_box = VariableBox()
+        self.ui.variablesLayout.addWidget(self.variable_box)
+
         self.ui.resize(1600, 900)
 
+        #connect single_shot routine signal
+        self.singleshot_routinebox.sender.send_sig.connect(self._add_variables)
+        self.singleshot_routinebox.sender.send_sig.connect(self._redo_connections)
         # Set the splitters to appropriate fractions of their maximum size:
         self.ui.splitter_horizontal.setSizes([1000, 600])
         self.ui.splitter_vertical.setSizes([300, 600])
         self.ui.show()
         # self.ui.showMaximized()
+
+    def _redo_connections(self):
+        """redo connections for variables to all routines in list"""
+        try:
+            for routine in self.singleshot_routinebox.routines:
+                self.variable_box.new_vars.connect(routine.update_user_vars)
+        except:
+            #already connected
+            pass
 
     def setup_config(self):
         config_path = os.path.join(config_prefix, '%s.ini' % socket.gethostname())
@@ -1654,6 +1779,9 @@ class Lyse(object):
     def connect_signals(self):
         if os.name == 'nt':
             self.ui.newWindow.connect(set_win_appusermodel)
+
+    def _add_variables(self):
+        self.variable_box.add_variables(self.singleshot_routinebox.user_vars)
 
 
 if __name__ == "__main__":
